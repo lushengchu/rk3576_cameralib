@@ -231,6 +231,12 @@ int qt_camera_stop_frame(CAMSTA dis_sta);
 int qt_camera_cam_control(CAMSTA cam_sta, char *name, void *input);
 
 /**********************************************************************
+ * 蓝牙耳机连上后调用。后台打开 SCO 并保持采集，开录时不再等待声卡。
+ * mac 例如 "A8:37:59:13:FE:B7"。已经打开过会直接返回。
+ **********************************************************************/
+int qt_camera_bt_audio_hold(const char *mac);
+
+/**********************************************************************
  * Description: 设置媒体存放位置
  * Parameter:
  * Return: SUCCESS/FAILURE

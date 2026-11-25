@@ -275,6 +275,15 @@ static void *camera_takepicture_dvp_jpg_start(void *p)
 #endif
 			//	stViFrame.stVFrame.u32Height -= 2;
 			//	stViFrame.stVFrame.u32VirHeight -= 2;
+				/* JPEG 高度按 16 对齐后比 VPSS 帧矮，按编码器尺寸送，避免 SendFrame 因尺寸不一致失败。 */
+				if(stViFrame.stVFrame.u32Width > (RK_U32)eContext[0].width)
+					stViFrame.stVFrame.u32Width = eContext[0].width;
+				if(stViFrame.stVFrame.u32VirWidth > (RK_U32)eContext[0].width)
+					stViFrame.stVFrame.u32VirWidth = eContext[0].width;
+				if(stViFrame.stVFrame.u32Height > (RK_U32)eContext[0].height)
+					stViFrame.stVFrame.u32Height = eContext[0].height;
+				if(stViFrame.stVFrame.u32VirHeight > (RK_U32)eContext[0].height)
+					stViFrame.stVFrame.u32VirHeight = eContext[0].height;
 				RK_MPI_VENC_SendFrame(eContext[0].veChn, &stViFrame, CONFIG_CAP_TIMEOUT);
 				s32Ret = RK_MPI_VENC_GetStream(eContext[0].veChn, &stFrame, CONFIG_CAP_TIMEOUT);
 				pData = (s32Ret == RK_SUCCESS) ? RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk) : NULL;
@@ -396,64 +405,58 @@ static void *camera_takepicture_mipi_jpg_start(void *p)
 	e_api.create_ve(&eContext[1]);
 	e_api.start_ve(&eContext[1]);
 
-	//拍照走 RK_MPI_VENC_GetStream 直接收帧，必须绑定 VPSS_CHN1->VENC；
-	//录像走手动 GetChnFrame/SendFrame，不绑定（mpp_create_ve 只对 rtsp veChn==3 绑定）。
-	//故此处为拍照单独绑定，结束前解绑，避免残留绑定影响录像。
-	MPP_CHN_S stCapSrcChn, stCapDestChn;
-	stCapSrcChn.enModId  = RK_ID_VPSS;
-	stCapSrcChn.s32DevId = eContext[1].s32Grp;
-	stCapSrcChn.s32ChnId = VPSS_CHN1;
-	stCapDestChn.enModId  = RK_ID_VENC;
-	stCapDestChn.s32DevId = eContext[1].veId;
-	stCapDestChn.s32ChnId = eContext[1].veChn;
-	s32Ret = RK_MPI_SYS_Bind(&stCapSrcChn, &stCapDestChn);
-	RK_LOGE("capture mipi RK_MPI_SYS_Bind %x", s32Ret);
-
-	//mipi drop frame
+	/* 和录像一样手动送帧。绑定 VPSS 后 JPEG 经常收不到流，可见光 jpg 就是空的。 */
+	VIDEO_FRAME_INFO_S stViFrame;
+	memset(&stViFrame, 0x0, sizeof(VIDEO_FRAME_INFO_S));
 	int drop_frame = 0;
 	int errCount = 0;
 	while(1)
 	{
-		RK_LOGE("chn %d",eContext[1].veChn);
-		s32Ret = RK_MPI_VENC_GetStream(eContext[1].veChn, &stFrame, CONFIG_CAP_TIMEOUT);
-		if (s32Ret == RK_SUCCESS) {
-			if(++drop_frame <= 5){
-				s32Ret = RK_MPI_VENC_ReleaseStream(eContext[1].veChn, &stFrame);
-				printf("mipi drop %d\n",drop_frame);
-				continue;
-			}
-			void *pData= RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
-			if(pData == NULL || stFrame.pstPack->u32Len == 0){
-				r_printf("%s mipi GetStream empty %x",__func__, s32Ret);
-				s32Ret = RK_MPI_VENC_ReleaseStream(eContext[1].veChn, &stFrame);
-				errCount ++;
-				if(errCount >= CONFIG_CAP_ERR_CNT){
-					camera_cap_send_filename(ACK_CAMERA_ERR);
-					fclose(fp3);
-					break;
-				}
-				continue;
-			}
-			fwrite(pData, 1, stFrame.pstPack->u32Len, fp3);
-			fflush(fp3);
+		if(errCount >= CONFIG_CAP_ERR_CNT){
+			camera_cap_send_filename(ACK_CAMERA_ERR);
 			fclose(fp3);
-			camera_cap_send_filename(ACK_CAMERA_CAPTURE3);
-			s32Ret = RK_MPI_VENC_ReleaseStream(eContext[1].veChn, &stFrame);
-			RK_LOGE("RK_MPI_VENC_ReleaseStream %x ",s32Ret);
 			break;
-		}else{
-			errCount ++; 
-			if(errCount >= CONFIG_CAP_ERR_CNT){
-				camera_cap_send_filename(ACK_CAMERA_ERR);
-				fclose(fp3);
-				break;
-			}
+		}
+		s32Ret = RK_MPI_VPSS_GetChnFrame(eContext[1].s32Grp, VPSS_CHN1, &stViFrame, CONFIG_CAP_TIMEOUT);
+		if (s32Ret != RK_SUCCESS) {
+			errCount++;
 			continue;
 		}
+		if(++drop_frame <= 5){
+			RK_MPI_VPSS_ReleaseChnFrame(eContext[1].s32Grp, VPSS_CHN1, &stViFrame);
+			printf("mipi drop %d\n", drop_frame);
+			continue;
+		}
+		RK_MPI_SYS_MmzFlushCache(stViFrame.stVFrame.pMbBlk, RK_TRUE);
+		if(stViFrame.stVFrame.u32Width > (RK_U32)eContext[1].width)
+			stViFrame.stVFrame.u32Width = eContext[1].width;
+		if(stViFrame.stVFrame.u32VirWidth > (RK_U32)eContext[1].width)
+			stViFrame.stVFrame.u32VirWidth = eContext[1].width;
+		if(stViFrame.stVFrame.u32Height > (RK_U32)eContext[1].height)
+			stViFrame.stVFrame.u32Height = eContext[1].height;
+		if(stViFrame.stVFrame.u32VirHeight > (RK_U32)eContext[1].height)
+			stViFrame.stVFrame.u32VirHeight = eContext[1].height;
+		RK_MPI_VENC_SendFrame(eContext[1].veChn, &stViFrame, CONFIG_CAP_TIMEOUT);
+		s32Ret = RK_MPI_VENC_GetStream(eContext[1].veChn, &stFrame, CONFIG_CAP_TIMEOUT);
+		void *pData = (s32Ret == RK_SUCCESS) ? RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk) : NULL;
+		if(pData == NULL || stFrame.pstPack->u32Len == 0){
+			r_printf("%s mipi GetStream fail %x", __func__, s32Ret);
+			if(s32Ret == RK_SUCCESS)
+				RK_MPI_VENC_ReleaseStream(eContext[1].veChn, &stFrame);
+			RK_MPI_VPSS_ReleaseChnFrame(eContext[1].s32Grp, VPSS_CHN1, &stViFrame);
+			errCount++;
+			continue;
+		}
+		fwrite(pData, 1, stFrame.pstPack->u32Len, fp3);
+		fflush(fp3);
+		fclose(fp3);
+		camera_cap_send_filename(ACK_CAMERA_CAPTURE3);
+		RK_MPI_VENC_ReleaseStream(eContext[1].veChn, &stFrame);
+		RK_MPI_VPSS_ReleaseChnFrame(eContext[1].s32Grp, VPSS_CHN1, &stViFrame);
+		RK_LOGE("sclu mipi tackpicture ok\n");
+		break;
 	}
 	free(stFrame.pstPack);
-	s32Ret = RK_MPI_SYS_UnBind(&stCapSrcChn, &stCapDestChn);
-	RK_LOGE("capture mipi RK_MPI_SYS_UnBind %x", s32Ret);
 	e_api.stop_ve(&eContext[1]);
 	e_api.destroy_ve(&eContext[1]);
 	//不能再 DisableChn(VPSS_CHN1):CHN1 为录像预建的共享通道,拍照只借用;关闭会导致拍照后录像取不到帧。

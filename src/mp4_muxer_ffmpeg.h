@@ -46,6 +46,9 @@ typedef struct muxInfo{
 	int vi;
 	int ai;
 	int ai_enable;
+	int audio_sample_rate;   /* 封装音频采样率，需与 AENC 一致 */
+	int audio_frame_samples; /* MP3 每帧每声道采样数：48k=1152，16k=576 */
+	int audio_channels;      /* 封装声道数，录像固定 2 */
 	int ptsInc;
 	int Afirst;
 	int w;
@@ -65,8 +68,11 @@ typedef struct muxInfo{
 	MUX_U64 shared_base_ts;  /* shared recording start time (us), 0 = use own base */
 	/* 统计信息 */
 	MUX_U64 write_frame_cnt;    /* 写入的视频帧数 */
+	MUX_U64 audio_pkt_ok;       /* 成功写入的音频包数 */
+	MUX_U64 audio_pkt_fail;     /* av_write_frame 失败次数 */
 	MUX_U64 first_write_pts;    /* 第一帧写入时的 PTS */
 	MUX_U64 last_write_pts;     /* 最后一帧写入时的 PTS */
+	int video_size_fixed;
 } MUX_INFO;
 
 //extern fun

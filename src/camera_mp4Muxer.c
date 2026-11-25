@@ -1,4 +1,5 @@
 #include <pthread.h>
+#include <string.h>
 #include <sys/stat.h>
 #include "mp4_muxer_ffmpeg.h"
 #include "camera_main.h"
@@ -69,6 +70,11 @@ static int MP4_Muxer_Add_Stream(MUX_INFO *info)
         mux_log("AVMEDIA_TYPE_VIDEO\n");
         pAVStream->codecpar->codec_id = AV_CODEC_ID_H264;
         pAVStream->codecpar->bit_rate =2000;//2000 (值越大，MP4时长越长)好像不影响(1280 * 2)+ (1024*30/30)=3584
+        /* 1280x516 配下去，编码器实际 SPS 是 640x512。容器若写 1280x516，播放器按这个尺寸协商失败。 */
+        if(info->w == 1280 && info->h == 516){
+            info->w = 640;
+            info->h = 512;
+        }
         pAVStream->codecpar->width = info->w;
         pAVStream->codecpar->height = info->h;
         pAVStream->codecpar->format = AV_PIX_FMT_YUV420P;
@@ -81,16 +87,31 @@ static int MP4_Muxer_Add_Stream(MUX_INFO *info)
     }
 
 	if(info->ai_enable){
-		if((acodec)->type == AVMEDIA_TYPE_AUDIO){
-			mux_log("AVMEDIA_TYPE_AUDIO\n");
+		if(acodec && acodec->type == AVMEDIA_TYPE_AUDIO){
+			int sample_rate = info->audio_sample_rate > 0 ? info->audio_sample_rate : 48000;
+			int frame_samples = info->audio_frame_samples > 0 ? info->audio_frame_samples : AUDIO_LEN;
+			int channels = info->audio_channels == 1 ? 1 : 2;
+			uint64_t layout = (channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+			mux_log("AVMEDIA_TYPE_AUDIO rate=%d frame=%d ch=%d\n", sample_rate, frame_samples, channels);
+			/* 参数写在 codecpar 和 codec 上。这份 ffmpeg 写包时读 AVStream.codec。 */
 			aAVStream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-			aAVStream->codecpar->codec_id = AV_CODEC_ID_MP3;//AV_CODEC_ID_MP2;	//AAC
-			aAVStream->codecpar->bit_rate = 160000;	//the average bitrate平均比特率
-			aAVStream->codecpar->sample_rate = 48000;	//采集已改 48k(避免播放侧 codec 时钟污染导致音频轨 3x 膨胀)，必须与 AENC 配置一致
-			aAVStream->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;	//双声道 右声道
-			aAVStream->codecpar->channels =2;  //通道数2
-			aAVStream->codecpar->frame_size = AUDIO_LEN;	//音频帧中每个信道的采样数(AAC 1024字节 MP2 1152 字节)
-			aAVStream->time_base = (AVRational){1, 48000};	//时间基aAVCodecCtx->sample_rate 这是表示帧时间戳的基本时间单位(以秒为单位)。
+			aAVStream->codecpar->codec_id = AV_CODEC_ID_MP3;
+			aAVStream->codecpar->bit_rate = 160000;
+			aAVStream->codecpar->sample_rate = sample_rate;
+			aAVStream->codecpar->channel_layout = layout;
+			aAVStream->codecpar->channels = channels;
+			aAVStream->codecpar->frame_size = frame_samples;
+			if(aAVStream->codec){
+				aAVStream->codec->codec_type = AVMEDIA_TYPE_AUDIO;
+				aAVStream->codec->codec_id = AV_CODEC_ID_MP3;
+				aAVStream->codec->bit_rate = 160000;
+				aAVStream->codec->sample_rate = sample_rate;
+				aAVStream->codec->channel_layout = layout;
+				aAVStream->codec->channels = channels;
+				aAVStream->codec->frame_size = frame_samples;
+				aAVStream->codec->time_base = (AVRational){1, sample_rate};
+			}
+			aAVStream->time_base = (AVRational){1, sample_rate};
 		}
 	}
 
@@ -198,79 +219,285 @@ exit_outFmt_failed:
     {
         mux_err("avformat_free_context(g_OutFmt_Ctx);247 exection\n");
         avformat_free_context(info->g_OutFmt_Ctx);
+        info->g_OutFmt_Ctx = NULL;
     }
     return -1;
+}
+
+static int write_one_audio_frame(MUX_INFO *info, AVStream *Apst, const unsigned char *data, int len, MUX_U64 a_ts)
+{
+	AVPacket apkt;
+	int ret;
+	int64_t time_diff;
+	int frame_samples;
+
+	memset(&apkt, 0, sizeof(apkt));
+	/* 拷进带填充的 AVPacket。直接挂 AENC 指针时，这份 ffmpeg 不认这个包，音轨不会进文件。 */
+	if(av_new_packet(&apkt, len) < 0){
+		mux_err("Muxing:av_new_packet %d failed\n", len);
+		info->audio_pkt_fail++;
+		return MUX_FAILURE;
+	}
+	memcpy(apkt.data, data, len);
+
+	time_diff = (int64_t)(a_ts - info->Audio_PTS);
+	if(time_diff < 0)
+		time_diff = 0;
+	apkt.pts = av_rescale_q(time_diff, (AVRational){1, 1000000}, Apst->time_base);
+
+	frame_samples = info->audio_frame_samples > 0 ? info->audio_frame_samples : AUDIO_LEN;
+	if(Apst->codecpar == NULL || Apst->codecpar->sample_rate <= 0 || Apst->time_base.den <= 0){
+		mux_err("Muxing:audio stream not ready, rate=%d tb=%d/%d\n",
+			Apst->codecpar ? Apst->codecpar->sample_rate : 0,
+			Apst->time_base.num, Apst->time_base.den);
+		info->audio_pkt_fail++;
+		av_packet_unref(&apkt);
+		return MUX_FAILURE;
+	}
+	apkt.duration = av_rescale_q(frame_samples, (AVRational){1, Apst->codecpar->sample_rate}, Apst->time_base);
+	if(apkt.duration <= 0)
+		apkt.duration = 1;
+	if(info->last_audio_pts > 0 && apkt.pts > (int64_t)info->last_audio_pts + apkt.duration * 8)
+		apkt.pts = info->last_audio_pts + apkt.duration;
+	if(info->last_audio_pts == 0 && apkt.pts > apkt.duration * 48000)
+		apkt.pts = 0;
+	if(apkt.pts <= (int64_t)info->last_audio_pts)
+		apkt.pts = info->last_audio_pts + 1;
+	info->last_audio_pts = apkt.pts;
+	apkt.dts = apkt.pts;
+	apkt.pos = -1;
+	apkt.stream_index = Apst->index;
+
+	pthread_mutex_lock(&info->write_lock);
+	ret = av_write_frame(info->g_OutFmt_Ctx, &apkt);
+	pthread_mutex_unlock(&info->write_lock);
+	av_packet_unref(&apkt);
+	if(ret < 0)
+	{
+		info->audio_pkt_fail++;
+		mux_err("Muxing:cannot write audio frame, ret=%d len=%d\n", ret, len);
+		return MUX_FAILURE;
+	}
+	info->audio_pkt_ok++;
+	return MUX_SUCCESS;
 }
 
 int MP4_Muxer_WriteAudio(MUX_INFO *info, MUX_AUDIO_STREAM_S *pstStream)
 {
 	unsigned char* pPackVirtAddr = NULL;	//码流数据首地址
     unsigned int u32PackLen = 0;	//码流数据长度
-    int ret = 0;
     AVStream *Apst = NULL;	//用于指向音频流
-    AVPacket apkt;	//定义一个包
-    memset(&apkt, 0, sizeof(AVPacket));
 
 	if((NULL == pstStream)||(info->ai_enable == 0))
     {
         return MUX_SUCCESS;
     }
-    if(info->ai<0)	//如果文件里面没有音频流
+    if(info->g_OutFmt_Ctx == NULL)
     {
-        mux_err("ai less than 0 \n");
+        return MUX_FAILURE;
+    }
+    if(info->ai<0 || info->ai >= (int)info->g_OutFmt_Ctx->nb_streams)
+    {
+        mux_err("ai %d out of range\n", info->ai);
         return MUX_SUCCESS;
     }
     //获取音频码流信息
     pPackVirtAddr = pstStream->pStream;	//带７字节ADTS头
     u32PackLen = pstStream->u32Len;
-    //av_init_packet(&apkt);	//初始化AVpack包
+    if(pPackVirtAddr == NULL || u32PackLen == 0)
+    {
+        return MUX_SUCCESS;
+    }
+    /* AENC 输出缓冲按 u32MaxFrmLen=2048 申请。长度异常时只取前 2048，避免把缓存后面的未映射页读进来。 */
+    if(u32PackLen > 2048)
+        u32PackLen = 2048;
     Apst = info->g_OutFmt_Ctx->streams[info->ai];	//ai代表音频流索引号
     MUX_U64 a_ts = pstStream->u64TimeStamp;
     if(info->Afirst==0)	//如果是第一个音频帧
     {
         info->Afirst=1;
-        //优先使用shared_base_ts（与视频相同的基准），保证音视频同步
-        info->Audio_PTS = (info->shared_base_ts != 0) ? info->shared_base_ts : a_ts;
+        /* 视频基准是 CLOCK_MONOTONIC。本机麦的 AENC 时间戳也是这套钟，直接相减就能和视频对齐。
+         * 蓝牙 SCO 的时间戳是墙上时钟，和单调时钟相差几十年。若仍用 shared_base_ts 做减法，
+         * 音轨时长会变成当前 Unix 时间，播放器打不开视频。这时改用音频自己的第一帧做原点。 */
+        int same_clock = 0;
+        if(info->shared_base_ts != 0){
+            int64_t delta = (int64_t)a_ts - (int64_t)info->shared_base_ts;
+            if(delta < 0)
+                delta = -delta;
+            if(delta <= 3600LL * 1000000LL)
+                same_clock = 1;
+        }
+        if(same_clock){
+            info->Audio_PTS = info->shared_base_ts;
+        }else{
+            int64_t wall_off = 0;
+            if(info->shared_base_ts != 0){
+                wall_off = (int64_t)TEST_COMM_GetNowUs() - (int64_t)info->shared_base_ts;
+                if(wall_off < 0 || wall_off > 3600LL * 1000000LL)
+                    wall_off = 0;
+            }
+            info->Audio_PTS = a_ts - (MUX_U64)wall_off;
+            mux_log("[MUX-AUDIO] rebase timestamp, a_ts=%llu video_base=%llu wall_off=%lld us",
+                (unsigned long long)a_ts, (unsigned long long)info->shared_base_ts, (long long)wall_off);
+        }
 	}
 
-	// 计算相对于基准的时间戳
-	int64_t time_diff = (int64_t)(a_ts - info->Audio_PTS);
-	if(time_diff < 0)
-		time_diff = 0;
-	// 转换时间戳到流的时间基（假设时间戳单位是微秒）
-	apkt.pts = av_rescale_q(time_diff, (AVRational){1, 1000000}, Apst->time_base);
-
-	//修复音频DTS重复问题：强制PTS单调递增
-	if(apkt.pts <= (int64_t)info->last_audio_pts)
-	{
-		apkt.pts = info->last_audio_pts + 1;
+	/* 按 AENC 原始包整包写入。切成从 0xFFFB 开始的帧后，封装器会按帧长去读，第一包就段错误。 */
+	if(info->Afirst == 1 && info->last_audio_pts == 0){
+		mux_log("[MUX-AUDIO] first pkt len=%u head=%02x%02x%02x%02x",
+			u32PackLen,
+			pPackVirtAddr[0],
+			u32PackLen > 1 ? pPackVirtAddr[1] : 0,
+			u32PackLen > 2 ? pPackVirtAddr[2] : 0,
+			u32PackLen > 3 ? pPackVirtAddr[3] : 0);
 	}
-	info->last_audio_pts = apkt.pts;
-
-	apkt.dts = apkt.pts;
-	
-	// 设置正确的duration（基于采样率和帧大小）
-	apkt.duration = av_rescale_q(AUDIO_LEN, (AVRational){1, Apst->codecpar->sample_rate}, Apst->time_base);
-
-    apkt.pos = -1;
-    apkt.stream_index = Apst->index;	//音频流的索引号 赋给 包里面流索引号，表示这个包属于音频流
-    apkt.data = pPackVirtAddr ;	//接受音频数据
-    apkt.size = u32PackLen;	//音频数据长度
-
-    pthread_mutex_lock(&info->write_lock);
-    /* 使用 av_write_frame 代替 av_interleaved_write_frame
-     * av_interleaved_write_frame 会重新排序帧并修改 PTS，导致 MP4 duration 错误 */
-    ret = av_write_frame(info->g_OutFmt_Ctx, &apkt);
-    if (ret < 0)
-    {
-        mux_err("Muxing:cannot write audio frame, ret=%d\n", ret);
-        pthread_mutex_unlock(&info->write_lock);
-        return MUX_FAILURE;
-	}
-    pthread_mutex_unlock(&info->write_lock);
-    //清除音频包
-    av_packet_unref(&apkt);
+	if(write_one_audio_frame(info, Apst, pPackVirtAddr, (int)u32PackLen, a_ts) != MUX_SUCCESS)
+		return MUX_FAILURE;
 	return MUX_SUCCESS;
+}
+
+static int br_u(const unsigned char *d, int len, int *bit, int n)
+{
+	int v = 0;
+	int i;
+	for(i = 0; i < n; i++){
+		int bi = (*bit)++;
+		if(bi / 8 >= len)
+			return 0;
+		v = (v << 1) | ((d[bi / 8] >> (7 - (bi % 8))) & 1);
+	}
+	return v;
+}
+
+static int br_ue(const unsigned char *d, int len, int *bit)
+{
+	int z = 0;
+	while(br_u(d, len, bit, 1) == 0 && z < 31)
+		z++;
+	return ((1 << z) - 1) + (z ? br_u(d, len, bit, z) : 0);
+}
+
+static int br_se(const unsigned char *d, int len, int *bit)
+{
+	int v = br_ue(d, len, bit);
+	return (v & 1) ? (v + 1) / 2 : -(v / 2);
+}
+
+static void skip_scaling_list(const unsigned char *d, int len, int *bit, int size)
+{
+	int last = 8, next = 8, j;
+	for(j = 0; j < size; j++){
+		int delta = br_se(d, len, bit);
+		next = (last + delta + 256) % 256;
+		if(next == 0)
+			break;
+		last = next;
+	}
+}
+
+/* 从 Annex-B 关键帧里取出 SPS 宽高。失败返回 -1。 */
+static int h264_sps_size(const unsigned char *buf, int len, int *w, int *h)
+{
+	int i;
+	const unsigned char *nal = NULL;
+	int nal_len = 0;
+	unsigned char rb[128];
+	int rb_len = 0;
+	int bit = 0;
+	int profile, chroma, frame_mbs_only, crop;
+	int pic_w, pic_h;
+	int k;
+
+	for(i = 0; i + 5 < len; i++){
+		int sc = 0;
+		if(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)
+			sc = 3;
+		else if(i + 4 < len && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
+			sc = 4;
+		if(!sc)
+			continue;
+		if((buf[i + sc] & 0x1f) != 7)
+			continue;
+		nal = buf + i + sc + 1;
+		nal_len = len - (i + sc + 1);
+		if(nal_len > 80)
+			nal_len = 80;
+		break;
+	}
+	if(!nal)
+		return -1;
+
+	for(k = 0; k < nal_len && rb_len < (int)sizeof(rb); k++){
+		if(k + 2 < nal_len && nal[k] == 0 && nal[k + 1] == 0 && nal[k + 2] == 3){
+			rb[rb_len++] = 0;
+			rb[rb_len++] = 0;
+			k += 2;
+		}else{
+			rb[rb_len++] = nal[k];
+		}
+	}
+	if(rb_len < 4)
+		return -1;
+
+	profile = br_u(rb, rb_len, &bit, 8);
+	br_u(rb, rb_len, &bit, 8);
+	br_u(rb, rb_len, &bit, 8);
+	br_ue(rb, rb_len, &bit);
+	chroma = 1;
+	if(profile == 100 || profile == 110 || profile == 122 || profile == 244){
+		chroma = br_ue(rb, rb_len, &bit);
+		if(chroma == 3)
+			br_u(rb, rb_len, &bit, 1);
+		br_ue(rb, rb_len, &bit);
+		br_ue(rb, rb_len, &bit);
+		br_u(rb, rb_len, &bit, 1);
+		if(br_u(rb, rb_len, &bit, 1)){
+			int n = (chroma != 3) ? 8 : 12;
+			int si;
+			for(si = 0; si < n; si++){
+				if(br_u(rb, rb_len, &bit, 1))
+					skip_scaling_list(rb, rb_len, &bit, si < 6 ? 16 : 64);
+			}
+		}
+	}
+	br_ue(rb, rb_len, &bit);
+	{
+		int poc = br_ue(rb, rb_len, &bit);
+		if(poc == 0){
+			br_ue(rb, rb_len, &bit);
+		}else if(poc == 1){
+			int n, t;
+			br_u(rb, rb_len, &bit, 1);
+			br_se(rb, rb_len, &bit);
+			br_se(rb, rb_len, &bit);
+			n = br_ue(rb, rb_len, &bit);
+			for(t = 0; t < n; t++)
+				br_se(rb, rb_len, &bit);
+		}
+	}
+	br_ue(rb, rb_len, &bit);
+	br_u(rb, rb_len, &bit, 1);
+	pic_w = br_ue(rb, rb_len, &bit);
+	pic_h = br_ue(rb, rb_len, &bit);
+	frame_mbs_only = br_u(rb, rb_len, &bit, 1);
+	if(!frame_mbs_only)
+		br_u(rb, rb_len, &bit, 1);
+	br_u(rb, rb_len, &bit, 1);
+	crop = br_u(rb, rb_len, &bit, 1);
+	*w = (pic_w + 1) * 16;
+	*h = (pic_h + 1) * 16 * (2 - frame_mbs_only);
+	if(crop){
+		int cl = br_ue(rb, rb_len, &bit);
+		int cr = br_ue(rb, rb_len, &bit);
+		int ct = br_ue(rb, rb_len, &bit);
+		int cb = br_ue(rb, rb_len, &bit);
+		int unit = (chroma == 1) ? 2 : 1;
+		*w -= (cl + cr) * unit;
+		*h -= (ct + cb) * unit * (2 - frame_mbs_only);
+	}
+	if(*w <= 0 || *h <= 0 || *w > 8192 || *h > 8192)
+		return -1;
+	return 0;
 }
 
 static int getVopType( const void *p, int len )
@@ -310,9 +537,8 @@ void MP4_Muxer_WriteVideo(MUX_INFO *info, unsigned char *ptr , unsigned int len,
     AVPacket vpkt;
     memset(&vpkt, 0, sizeof(AVPacket));
 
-    if(info->vi<0)
+    if(info->g_OutFmt_Ctx == NULL || info->vi<0)
 	{
-		mux_err("vi less than 0 \n");
 		return;
 	}
 	if(info->vi >= (int)info->g_OutFmt_Ctx->nb_streams)
@@ -335,6 +561,27 @@ void MP4_Muxer_WriteVideo(MUX_INFO *info, unsigned char *ptr , unsigned int len,
 	}
 
 	vpkt.stream_index = pst->index;	//视频流的索引号 赋给 包里面的流索引号，表示这个包属于视频流
+
+	/* 封装宽高按码流里的 SPS，不按配置的 1280x516。实际编码是 640x512，
+	 * 容器写成 1280x516 时播放器按这个尺寸协商，视频解不出来。 */
+	if(!info->video_size_fixed && (vpkt.flags & AV_PKT_FLAG_KEY))
+	{
+		int vw = 0, vh = 0;
+		if(h264_sps_size(pPackVirtAddr, u32PackLen, &vw, &vh) == 0 && vw > 0 && vh > 0)
+		{
+			pst->codecpar->width = vw;
+			pst->codecpar->height = vh;
+			if(pst->codec)
+			{
+				pst->codec->width = vw;
+				pst->codec->height = vh;
+			}
+			info->w = vw;
+			info->h = vh;
+			info->video_size_fixed = 1;
+			mux_log("[MUX-VIDEO] sps size %dx%d", vw, vh);
+		}
+	}
 
 	//用真实时间戳计算相对基准的pts，丢帧时时长依然正确，三路视频时间一致（时间戳单位us）
 	//优先使用shared_base_ts（全局录像开始时间），保证三路视频时长一致
@@ -465,9 +712,14 @@ void MP4_Muxer_Close(MUX_INFO *info)
 {
 	RK_U64 close_start_us = TEST_COMM_GetNowUs();
 	char file_path[256] = {0x0};
-	mux_log("[MUX-CLOSE] START file=%s (w=%d)", info->g_OutFmt_Ctx ? info->g_OutFmt_Ctx->url : "NULL", info->w);
+	const char *url = "NULL";
 	if (info->g_OutFmt_Ctx && info->g_OutFmt_Ctx->url)
-		snprintf(file_path, sizeof(file_path), "%s", info->g_OutFmt_Ctx->url);
+		url = info->g_OutFmt_Ctx->url;
+	mux_log("[MUX-CLOSE] START file=%s (w=%d) audio_ok=%llu audio_fail=%llu", url, info->w,
+		(unsigned long long)info->audio_pkt_ok, (unsigned long long)info->audio_pkt_fail);
+	fflush(stdout);
+	if (url[0] != '\0' && strcmp(url, "NULL") != 0)
+		snprintf(file_path, sizeof(file_path), "%s", url);
 
 	/* 打印 Muxer 统计信息 */
 	//mux_log("[MUX-DEBUG] info=%p Close: write_frame_cnt=%llu, first_write_pts=%llu, last_write_pts=%llu",

@@ -428,6 +428,18 @@ static int mpp_ve_init(VencContext *eContext, enum venc_type type)
 			}
 			eContext->width = emsg.mipi_source_w;
 			eContext->height = emsg.mipi_source_h;
+			/* 融合裁剪还没给到有效宽高时，按传感器分辨率编码，避免 CreateChn a0048003、VIDn 空文件。 */
+			if(eContext->width < 16 || eContext->height < 16){
+				printf("mipi venc size %dx%d invalid, fallback %dx%d\n",
+					eContext->width, eContext->height,
+					CONFIG_MIPI_SRC_WIDTH, CONFIG_MIPI_SRC_HEIGHT);
+				eContext->width = CONFIG_MIPI_SRC_WIDTH;
+				eContext->height = CONFIG_MIPI_SRC_HEIGHT;
+				emsg.mipi_source_x = 0;
+				emsg.mipi_source_y = 0;
+				emsg.mipi_source_w = eContext->width;
+				emsg.mipi_source_h = eContext->height;
+			}
 			eContext->veId = 0;
 			eContext->veChn = 1;
 			eContext->s32Grp = 1;
@@ -493,6 +505,22 @@ static int mpp_create_ve(VencContext *eContext)
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
 		stAttr.stRcAttr.stH264Cbr.u32Gop = 60;
 		stAttr.stRcAttr.stH264Cbr.u32BitRate = eContext->bitrate;
+	}else if(stAttr.stVencAttr.enType == RK_VIDEO_ID_MJPEG){
+		/* JPEG 宽高必须 16 对齐。516、1080 会让 CreateChn 失败，红外和可见光都没有 jpg。 */
+		int aw = (int)eContext->width & ~15;
+		int ah = (int)eContext->height & ~15;
+		if(aw >= 16 && ah >= 16 && (aw != (int)eContext->width || ah != (int)eContext->height)){
+			printf("jpeg align %ux%u -> %dx%d\n", eContext->width, eContext->height, aw, ah);
+			eContext->width = aw;
+			eContext->height = ah;
+		}
+		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_MJPEGCBR;
+		stAttr.stRcAttr.stMjpegCbr.u32SrcFrameRateNum = 25;
+		stAttr.stRcAttr.stMjpegCbr.u32SrcFrameRateDen = 1;
+		stAttr.stRcAttr.stMjpegCbr.fr32DstFrameRateNum = 25;
+		stAttr.stRcAttr.stMjpegCbr.fr32DstFrameRateDen = 1;
+		stAttr.stRcAttr.stMjpegCbr.u32BitRate = 16384;
+		stAttr.stRcAttr.stMjpegCbr.u32StatTime = 1;
 	}
 	stAttr.stVencAttr.u32PicWidth = eContext->width;
     stAttr.stVencAttr.u32PicHeight = eContext->height;
@@ -500,6 +528,8 @@ static int mpp_create_ve(VencContext *eContext)
     stAttr.stVencAttr.u32VirHeight = eContext->height;
     stAttr.stVencAttr.u32StreamBufCnt = 5;
     stAttr.stVencAttr.u32BufSize = eContext->width * eContext->height;
+	if(stAttr.stVencAttr.enType == RK_VIDEO_ID_MJPEG)
+		stAttr.stVencAttr.u32BufSize = eContext->width * eContext->height * 3 / 2;
 
     s32Ret = RK_MPI_VENC_CreateChn(eContext->veChn, &stAttr);
 	printf("RK_MPI_VENC_CreateChn %x, eContext->s32Grp=%d eContext->veChn=%d\n", s32Ret, eContext->s32Grp, eContext->veChn);
@@ -541,8 +571,8 @@ static int mpp_create_ve(VencContext *eContext)
 		stParam.stCropCfg.stScaleRect.stSrc.u32Height = 0;
 		stParam.stCropCfg.stScaleRect.stDst.s32X = 0;
 		stParam.stCropCfg.stScaleRect.stDst.s32Y = 0;
-		stParam.stCropCfg.stScaleRect.stDst.u32Width = emsg.mipi_source_w;
-		stParam.stCropCfg.stScaleRect.stDst.u32Height = emsg.mipi_source_h;
+		stParam.stCropCfg.stScaleRect.stDst.u32Width = eContext->width;
+		stParam.stCropCfg.stScaleRect.stDst.u32Height = eContext->height;
 		RK_MPI_VENC_SetChnParam(eContext->veChn, &stParam);
 	}
 

@@ -620,6 +620,11 @@ int camera_mpp_mipi_set_crop(int x, int y, int w, int h)
 {
 	RK_S32 s32Ret;
 	VPSS_CROP_INFO_S stCropInfo;
+	/* 宽高为 0 时 SetChnAttr 会把预览通道收成 0，可见光画面消失。 */
+	if(w < 16 || h < 16){
+		RK_LOGE("mipi crop ignore invalid %d,%d %dx%d", x, y, w, h);
+		return RK_FAILURE;
+	}
 	stCropInfo.bEnable = 1;
 	VPSS_CHN_ATTR_S stVpssChnAttr;
 

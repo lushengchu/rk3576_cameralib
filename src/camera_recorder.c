@@ -126,6 +126,14 @@ static venc_frame_queue_t frame_q_dvp, frame_q_mipi, frame_q_drm;
 static MUX_INFO *g_audio_mux_list[3] = {NULL, NULL, NULL};  // 全局音频写入列表
 static int g_audio_mux_count = 0;
 static volatile int g_audio_ready = 0;  // 音频线程就绪标志
+/* 蓝牙连上后先把声卡打开并一直读着。开录只是开始往文件里写，不再现场等 SCO。 */
+static pthread_mutex_t g_audio_api_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_audio_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_audio_hold = 0;
+static volatile int g_audio_live = 0;
+static volatile int g_audio_thread_run = 0;
+static volatile int g_audio_thread_alive = 0;
+static volatile int g_ai_opened = 0;
 
 #define AENC_LOG_ENABLE
 #ifdef AENC_LOG_ENABLE
@@ -637,42 +645,25 @@ static void ai_dump_alsa_state(const char *tag)
 static void *camera_recorder_global_aenc_start(void *p)
 {
 	(void)p;
-	g_printf("%s start, mux_count=%d", __func__, g_audio_mux_count);
-	
-	if(g_audio_mux_count == 0){
-		g_printf("%s no mux need audio, exit", __func__);
-		return NULL;
-	}
+	g_printf("%s start, mux_count=%d hold=%d", __func__, g_audio_mux_count, g_audio_hold);
 
 	// 调用 mp3_encoder 的初始化部分（复用 mp3_encoder 里的 open_device_ai + init_mpi_aenc）
 	// 这里直接调用 mp3_encoder，但让它只初始化一次，然后我们在外面读 AENC 数据
 	// 最简单的方式：让第一个 mux 调用 mp3_encoder，但 mp3_encoder 内部会独占 AI
 	// 所以我们需要自己实现：初始化 AI+AENC，然后循环读数据写入所有 mux
 	
-	RK_S32 u32SampleRate = 48000;
+	/* 本机麦和蓝牙都按双声道、48k 打开。帧长必须是 1152*2*2=4608。
+	 * 16k/8k 的 MPEG-2 MP3 封装会失败，而且每个采样率都去试一次会把打开拖成大约 2 秒。 */
+	int bluetooth = emsg.audio_card_name[0] != '\0';
 	RK_S32 u32Channel = 2;
-	/* 改用 48k 采集：Qt 播放会把共享 codec 时钟带到 48k，播完立刻录像时 AI 按 16k 配置
-	 * 却拿到 48k 时钟的数据，音频轨膨胀 3 倍(录10s文件34s)。48k 与播放侧一致，
-	 * 干净/被污染两种状态下硬件都按配置速率跑。
-	 * 16000Hz 用 576*2*channel，32000/44100/48000 用 1152*2*channel */
-	RK_U32 u32FrameCnt = 1152 * 2 * u32Channel;  // = 4608
-	RK_CHAR *pCodecName = (RK_CHAR *)"mp3";
-	
+	RK_S32 u32EncRate = 48000;
+	RK_S32 u32FrameSamples = 1152;
+	if(emsg.audio_sample_rate > 0)
+		u32EncRate = emsg.audio_sample_rate;
+	if(emsg.audio_frame_samples > 0)
+		u32FrameSamples = emsg.audio_frame_samples;
 	RegisterAencMp3();
-	
-	ai_dump_alsa_state("before_ai_open");
-	if(open_device_ai(u32SampleRate, u32SampleRate, u32Channel, u32FrameCnt)){
-		g_printf("%s open_device_ai failed", __func__);
-		return NULL;
-	}
-	ai_dump_alsa_state("after_ai_open");
-	
-	if(init_mpi_aenc(u32SampleRate, u32Channel)){
-		g_printf("%s init_mpi_aenc failed", __func__);
-		return NULL;
-	}
-	
-	// bind AI -> AENC
+
 	MPP_CHN_S stSrcChn, stDestChn;
 	stSrcChn.enModId = RK_ID_AI;
 	stSrcChn.s32DevId = 0;
@@ -680,34 +671,86 @@ static void *camera_recorder_global_aenc_start(void *p)
 	stDestChn.enModId = RK_ID_AENC;
 	stDestChn.s32DevId = 0;
 	stDestChn.s32ChnId = 0;
-	
-	RK_S32 ret = RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
-	if(ret){
-		g_printf("%s Bind AI to AENC failed! ret=%d", __func__, ret);
-		return NULL;
-	}
-	
-	g_printf("%s AENC init done, start reading stream", __func__);
-	
-	AUDIO_STREAM_S pstStream;
-	MUX_AUDIO_STREAM_S out_stStream;
-	memset(&out_stStream, 0, sizeof(MUX_AUDIO_STREAM_S));
 
-	/* 定位"音频轨时长膨胀"：周期性对比 AENC 时间戳推进量 vs CLOCK_MONOTONIC 推进量。
-	 * ratio≈1.0 正常；ratio≈3.0(=48000/16000) 说明声卡/编码器实际按 48k 时钟出数据，
-	 * 而 AI 按 16k 配置，时间戳与采样数都跑快 3 倍。packets/s 同理：正常约 27.7/s(16k/576)。 */
-	int audio_dbg_cnt = 0;
-	RK_U64 audio_dbg_first_ts = 0;
-	RK_U64 audio_dbg_first_wall = 0;
-	int audio_warmup_logged = 0;
+	while(g_audio_thread_run){
+		if(!g_audio_hold && recorder_exit_flag)
+			break;
 
-	while(1){
-		if(recorder_exit_flag){
+		bluetooth = emsg.audio_card_name[0] != '\0';
+		int aiOpened = 0;
+		int liveWait = 0;
+		RK_S32 period = u32FrameSamples * 2 * u32Channel;
+		while(!aiOpened && g_audio_thread_run){
+			if(!g_audio_hold && recorder_exit_flag)
+				break;
+			g_printf("%s audio card=%s rate=%d frame=%d period=%d ch=%d", __func__,
+				bluetooth ? emsg.audio_card_name : "hw:0,0",
+				u32EncRate, u32FrameSamples, period, u32Channel);
+			if(open_device_ai(u32EncRate, u32EncRate, u32Channel, period) == RK_SUCCESS){
+				aiOpened = 1;
+				break;
+			}
+			if(!bluetooth)
+				break;
+			/* 还没按下录像时一直等 SCO。已经在录了再等大约 1.5 秒仍打不开，改用本机麦。 */
+			if(g_audio_live){
+				liveWait++;
+				if(liveWait >= 15){
+					g_printf("%s SCO not ready, fallback hw:0,0", __func__);
+					emsg.audio_card_name[0] = '\0';
+					bluetooth = 0;
+					continue;
+				}
+			}
+			usleep(100 * 1000);
+		}
+		if(!aiOpened){
+			g_printf("%s open_device_ai failed", __func__);
 			break;
 		}
-		
-		ret = RK_MPI_AENC_GetStream(0, &pstStream, WAITTIME);
-		if(ret == RK_SUCCESS){
+		if(init_mpi_aenc(u32EncRate, u32Channel)){
+			g_printf("%s init_mpi_aenc failed", __func__);
+			RK_MPI_AI_DisableChn(0, 0);
+			RK_MPI_AI_Disable(0);
+			break;
+		}
+		RK_S32 ret = RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
+		if(ret){
+			g_printf("%s Bind AI to AENC failed! ret=%d", __func__, ret);
+			RK_MPI_AENC_DestroyChn(0);
+			RK_MPI_AI_DisableChn(0, 0);
+			RK_MPI_AI_Disable(0);
+			break;
+		}
+		g_ai_opened = 1;
+		g_printf("%s AENC init done, hold=%d live=%d", __func__, g_audio_hold, g_audio_live);
+
+		AUDIO_STREAM_S pstStream;
+		MUX_AUDIO_STREAM_S out_stStream;
+		memset(&out_stStream, 0, sizeof(MUX_AUDIO_STREAM_S));
+		int audio_dbg_cnt = 0;
+		RK_U64 audio_dbg_first_ts = 0;
+		RK_U64 audio_dbg_first_wall = 0;
+		int audio_warmup_logged = 0;
+		int stream_fail = 0;
+		/* 本机麦刚打开有爆音，丢掉前 500ms。蓝牙在开录前已经在采集，不能再丢。 */
+		const RK_U64 audio_drop_us = bluetooth ? 0 : 500000;
+		int reopen = 0;
+
+		while(g_audio_thread_run){
+			if(!g_audio_hold && recorder_exit_flag)
+				break;
+			ret = RK_MPI_AENC_GetStream(0, &pstStream, WAITTIME);
+			if(ret != RK_SUCCESS){
+				stream_fail++;
+				if(stream_fail >= 40){
+					g_printf("%s stream stalled, reopen", __func__);
+					reopen = 1;
+					break;
+				}
+				continue;
+			}
+			stream_fail = 0;
 			MB_BLK bBlk = pstStream.pMbBlk;
 			RK_VOID *pstFrame = RK_MPI_MB_Handle2VirAddr(bBlk);
 			RK_S32 frameSize = pstStream.u32Len;
@@ -727,46 +770,77 @@ static void *camera_recorder_global_aenc_start(void *p)
 				g_printf("[AENC-CLK] packets=%d ts_adv=%llu us wall_adv=%llu us ratio=%.3f packets/s=%.1f seq=%u len=%d",
 					audio_dbg_cnt, (unsigned long long)ts_adv, (unsigned long long)wall_adv,
 					ratio, pps, pstStream.u32Seq, frameSize);
-				/* ratio 明显偏离 1 时快照一次声卡状态，看是谁把时钟带偏的 */
-				if((ratio > 1.5 || ratio < 0.7) && audio_dbg_cnt == 100){
-					ai_dump_alsa_state("ratio_abnormal");
-				}
 			}
 
-			if(pstFrame && frameSize > 0 &&
-			   (TEST_COMM_GetNowUs() - audio_dbg_first_wall) >= 500000){
-				if(!audio_warmup_logged){
-					audio_warmup_logged = 1;
-					g_printf("[AENC-WARMUP] skipped first 500ms audio (pop on codec start after playback)");
+			pthread_mutex_lock(&g_audio_mu);
+			if(g_audio_live && pstFrame && frameSize > 0 &&
+			   (TEST_COMM_GetNowUs() - audio_dbg_first_wall) >= audio_drop_us){
+				int stale = 0;
+				if(g_audio_mux_count > 0 && g_audio_mux_list[0] && g_audio_mux_list[0]->shared_base_ts){
+					int64_t early = (int64_t)g_audio_mux_list[0]->shared_base_ts - (int64_t)timeStamp;
+					if(early > 300000 && early < 3600LL * 1000000LL)
+						stale = 1;
 				}
-				out_stStream.pStream = pstFrame;
-				out_stStream.u32Len = frameSize;
-				out_stStream.u32Seq = pstStream.u32Seq;
-				out_stStream.u64TimeStamp = timeStamp;
-				
-				// 写入所有需要录音的 mux（检查 g_OutFmt_Ctx 非 NULL，避免往未创建的 mux 写）
-				for(int i = 0; i < g_audio_mux_count; i++){
-					if(g_audio_mux_list[i] && g_audio_mux_list[i]->ai_enable && g_audio_mux_list[i]->g_OutFmt_Ctx){
-						MP4_Muxer_WriteAudio(g_audio_mux_list[i], &out_stStream);
+				if(!stale){
+					if(!audio_warmup_logged){
+						audio_warmup_logged = 1;
+						if(audio_drop_us > 0)
+							g_printf("[AENC-WARMUP] skipped first 500ms audio (pop on codec start after playback)");
+					}
+					out_stStream.pStream = pstFrame;
+					out_stStream.u32Len = frameSize;
+					out_stStream.u32Seq = pstStream.u32Seq;
+					out_stStream.u64TimeStamp = timeStamp;
+					for(int i = 0; i < g_audio_mux_count; i++){
+						if(g_audio_mux_list[i] && g_audio_mux_list[i]->ai_enable && g_audio_mux_list[i]->g_OutFmt_Ctx){
+							MP4_Muxer_WriteAudio(g_audio_mux_list[i], &out_stStream);
+						}
 					}
 				}
 			}
-			
+			pthread_mutex_unlock(&g_audio_mu);
 			RK_MPI_AENC_ReleaseStream(0, &pstStream);
 		}
+
+		g_ai_opened = 0;
+		RK_MPI_SYS_UnBind(&stSrcChn, &stDestChn);
+		RK_MPI_AI_DisableChn(0, 0);
+		RK_MPI_AI_Disable(0);
+		RK_MPI_AENC_DestroyChn(0);
+		if(!reopen || !g_audio_thread_run)
+			break;
 	}
-	
-	g_printf("%s exit, cleaning up", __func__);
-	
-	// cleanup
-	RK_MPI_SYS_UnBind(&stSrcChn, &stDestChn);
-	RK_MPI_AI_DisableChn(0, 0);
-	RK_MPI_AI_Disable(0);
-	RK_MPI_AENC_DestroyChn(0);
+
+	g_ai_opened = 0;
+	g_audio_thread_alive = 0;
 	UnRegisterAencMp3();
-	
 	g_printf("%s end", __func__);
 	return NULL;
+}
+
+int qt_camera_bt_audio_hold(const char *mac)
+{
+	if(mac == NULL || mac[0] == '\0')
+		return -1;
+	pthread_mutex_lock(&g_audio_api_mu);
+	snprintf(emsg.audio_card_name, sizeof(emsg.audio_card_name), "%s", mac);
+	emsg.audio_card_name[sizeof(emsg.audio_card_name) - 1] = '\0';
+	emsg.audio_sample_rate = 48000;
+	emsg.audio_frame_samples = 1152;
+	if(paenc_global != 0 && !g_audio_thread_alive){
+		pthread_join(paenc_global, NULL);
+		paenc_global = 0;
+	}
+	if(paenc_global == 0){
+		g_audio_hold = 1;
+		g_audio_live = 0;
+		g_audio_thread_run = 1;
+		g_audio_thread_alive = 1;
+		pthread_create(&paenc_global, NULL, camera_recorder_global_aenc_start, NULL);
+		g_printf("bt audio hold %s", emsg.audio_card_name);
+	}
+	pthread_mutex_unlock(&g_audio_api_mu);
+	return 0;
 }
 
 #if 0
@@ -1111,24 +1185,69 @@ static void camera_recorder_send_filename(void)
 }
 
 static struct record_context pContext;
+
+/* 蓝牙声卡没打开就先写视频，封装会在音轨前面插入一段空白。等采集真正起来再开录。 */
+static void camera_recorder_wait_bt_audio(void)
+{
+	if(emsg.audio_card_name[0] == '\0' || g_audio_mux_count == 0)
+		return;
+
+	pthread_mutex_lock(&g_audio_api_mu);
+	if(paenc_global != 0 && !g_audio_thread_alive){
+		pthread_join(paenc_global, NULL);
+		paenc_global = 0;
+	}
+	if(paenc_global == 0){
+		g_audio_hold = 1;
+		g_audio_live = 0;
+		g_audio_thread_run = 1;
+		g_audio_thread_alive = 1;
+		pthread_create(&paenc_global, NULL, camera_recorder_global_aenc_start, NULL);
+		g_printf("bt audio thread start before video");
+	}
+	pthread_mutex_unlock(&g_audio_api_mu);
+
+	if(g_ai_opened)
+		return;
+	g_printf("wait bt capture before video");
+	for(int i = 0; i < 40 && !g_ai_opened; i++)
+		usleep(100 * 1000);
+	g_printf("bt capture opened=%d", g_ai_opened);
+}
+
 int camera_recorder_start(struct cam_context *msg)
 {
 	int ret = SUCCESS;
 	char card_name[128] = {0};
 	//init start
 	recorder_exit_flag = 3;
-	if(emsg.record_path[3][0] != 0x0){
-		memcpy(card_name, emsg.record_path[3], sizeof(card_name));
+	/* 声卡名在 audio_card_name，不能再从 record_path[3] 取：
+	 * 后面 get_save_filename() 会把 record_path[3] 写成 VIDd_*.mp4。 */
+	if(emsg.audio_card_name[0] != '\0'){
+		snprintf(card_name, sizeof(card_name), "%s", emsg.audio_card_name);
 	}
 	int mode = 0;
 	int aimode = 0;
 	mode = emsg.record_path[2][0];
 	aimode = emsg.record_path[2][1];
-	g_printf("mode %d aimode %d",mode,aimode);
+	g_printf("mode %d aimode %d cardname %s", mode, aimode, card_name);
 
 	memset(&mux_dvp, 0x0 , sizeof(MUX_INFO));
 	memset(&mux_mipi, 0x0 , sizeof(MUX_INFO));
 	memset(&mux_drm, 0x0 , sizeof(MUX_INFO));
+	/* 封装和 AENC 固定 48k/1152。16k/576 的 MPEG-2 MP3 会让 avformat_write_header 失败。 */
+	emsg.audio_sample_rate = 48000;
+	emsg.audio_frame_samples = 1152;
+	mux_dvp.audio_sample_rate = emsg.audio_sample_rate;
+	mux_mipi.audio_sample_rate = emsg.audio_sample_rate;
+	mux_drm.audio_sample_rate = emsg.audio_sample_rate;
+	mux_dvp.audio_frame_samples = emsg.audio_frame_samples;
+	mux_mipi.audio_frame_samples = emsg.audio_frame_samples;
+	mux_drm.audio_frame_samples = emsg.audio_frame_samples;
+	/* 封装固定双声道，和上面 AI/AENC 的 u32Channel 一致。 */
+	mux_dvp.audio_channels = 2;
+	mux_mipi.audio_channels = 2;
+	mux_drm.audio_channels = 2;
 
 	//修复三路视频时长不一致问题：使用统一的录像开始时间作为基准时间戳
 	//这样所有muxer的PTS都相对于同一时刻，时长一致
@@ -1186,6 +1305,15 @@ int camera_recorder_start(struct cam_context *msg)
 	//读到 flag>=1 立刻 break，录出 0 帧(线程串行调度时必现，DRM 因创建较晚才侥幸躲过)。
 	recorder_exit_flag = 0;
 
+	if(emsg.audio_card_name[0] != '\0' && g_audio_mux_count > 0){
+		camera_recorder_wait_bt_audio();
+		/* 基准改到采集已经打开的这一刻，避免音轨 PTS 比画面晚两秒。 */
+		record_start_us = TEST_COMM_GetNowUs();
+		mux_dvp.shared_base_ts = record_start_us;
+		mux_mipi.shared_base_ts = record_start_us;
+		mux_drm.shared_base_ts = record_start_us;
+	}
+
 	switch(mode){
 		case CAM_IR_RECORD:
 			pthread_create(&recorder0, NULL ,camera_recorder_dvp_mp4_start, (void *)&pContext);
@@ -1215,18 +1343,27 @@ int camera_recorder_start(struct cam_context *msg)
 			break;
 	}
 
-	// 启动全局音频线程（只初始化一次 AI+AENC，同时写入所有需要录音的 mux）
-	// 注意：等录像线程启动并创建好 MP4 muxer 后再启动音频线程，避免 AENC 队列溢出丢帧
-	// 音频线程内部会用条件变量等待 g_audio_ready 信号
-
-	// 等待所有录像线程启动完成（给 MP4_Muxer_Create 时间）
-	usleep(200000);  // 200ms
-	
-	// 现在 mux 应该都创建好了，启动音频线程
+	/* 声卡若已在蓝牙连接时打开，这里只开始写入，不再等 SCO，也不再空等 200ms。 */
 	if(g_audio_mux_count > 0){
-		g_audio_ready = 1;  // 先置位，音频线程启动后直接开始写
-		pthread_create(&paenc_global, NULL, camera_recorder_global_aenc_start, NULL);
-		g_printf("audio mux ready, start global aenc thread");
+		pthread_mutex_lock(&g_audio_api_mu);
+		if(paenc_global != 0 && !g_audio_thread_alive){
+			pthread_join(paenc_global, NULL);
+			paenc_global = 0;
+		}
+		if(paenc_global == 0){
+			g_audio_hold = 0;
+			g_audio_thread_run = 1;
+			g_audio_thread_alive = 1;
+			pthread_create(&paenc_global, NULL, camera_recorder_global_aenc_start, NULL);
+			g_printf("audio mux ready, start global aenc thread");
+		}else{
+			g_printf("audio thread running, opened=%d", g_ai_opened);
+		}
+		pthread_mutex_unlock(&g_audio_api_mu);
+		pthread_mutex_lock(&g_audio_mu);
+		g_audio_live = 1;
+		pthread_mutex_unlock(&g_audio_mu);
+		g_audio_ready = 1;
 	}
 
 	return ret;
@@ -1260,6 +1397,11 @@ int camera_recorder_stop(struct cam_context *msg)
 	printf("recorder_exit_flag!!\n");
 	RK_U64 stop_start_us = TEST_COMM_GetNowUs();
 	g_printf("[REC-STOP] START closing all muxers at %lu us", stop_start_us);
+	pthread_mutex_lock(&g_audio_mu);
+	g_audio_live = 0;
+	pthread_mutex_unlock(&g_audio_mu);
+	if(!g_audio_hold)
+		g_audio_thread_run = 0;
 	recorder_exit_flag = 1;
 	//所有线程统一在 flag>=1 时退出，无需分阶段递增
 	//join 顺序不重要，因为三路线程几乎同时退出，确保视频时长一致
@@ -1272,8 +1414,8 @@ int camera_recorder_stop(struct cam_context *msg)
 
     recorder0 = recorder1 = recorder2 = 0;
 
-    // 等待全局音频线程结束
-    if(paenc_global != 0){
+    /* 蓝牙预打开的采集线程留着，下一次开录不用再等 SCO。本机麦录完就关掉。 */
+    if(paenc_global != 0 && !g_audio_hold){
         pthread_join(paenc_global, NULL);
         paenc_global = 0;
     }

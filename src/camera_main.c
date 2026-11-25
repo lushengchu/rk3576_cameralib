@@ -560,13 +560,28 @@ int qt_camera_cam_control(CAMSTA cam_sta, char *name, void *input)
 				if(name != NULL){
 					strcpy(emsg.record_path[0], name);
 				}
+				/* 封装和 MP3 编码固定 48k/1152。MP4 不接受 16k/576 的 MPEG-2 MP3，
+				 * avformat_write_header 会失败并把这一路文件丢掉。
+				 * 蓝牙 SCO 的实际采样率在打开声卡时再重采样到 48k。 */
+				emsg.audio_sample_rate = 48000;
+				emsg.audio_frame_samples = 1152;
 				if(input != NULL){
 					recordinput *rinput = (recordinput *)input;
-					if(rinput->cardname[0] != 0x0){
-						memcpy(emsg.record_path[3], rinput->cardname, sizeof(rinput->cardname));
+					if(rinput->cardname[0] != '\0'){
+						/* 采集线程可能正在读这个名字。相同 MAC 不要先清空再写回去。 */
+						if(strncmp(emsg.audio_card_name, rinput->cardname, sizeof(rinput->cardname)) != 0){
+							memset(emsg.audio_card_name, 0, sizeof(emsg.audio_card_name));
+							memcpy(emsg.audio_card_name, rinput->cardname, sizeof(rinput->cardname));
+							emsg.audio_card_name[sizeof(emsg.audio_card_name) - 1] = '\0';
+						}
+					}else{
+						emsg.audio_card_name[0] = '\0';
 					}
 					emsg.record_path[2][0] = rinput->mode;
 					emsg.record_path[2][1] = rinput->aichl;
+					y_printf("%s record mode %d aichl %d cardname %s rate %d frame %d", __func__,
+						rinput->mode, rinput->aichl, emsg.audio_card_name,
+						emsg.audio_sample_rate, emsg.audio_frame_samples);
 				}
 				break;
 			case CAM_CAMERA_RECORDSTOP:
@@ -698,6 +713,12 @@ int qt_camera_ai_set_vendor(int vendor)
 }
 int qt_camera_source_vl_set_crop(int x, int y, int w, int h)
 {
+	if(w < 16 || h < 16){
+		y_printf("%s ignore invalid crop x %d y %d w %d h %d, keep %d %d %d %d",
+			__func__, x, y, w, h,
+			emsg.mipi_source_x, emsg.mipi_source_y, emsg.mipi_source_w, emsg.mipi_source_h);
+		return SUCCESS;
+	}
 	emsg.mipi_source_x = x; //2
 	emsg.mipi_source_y = y; //2
 	emsg.mipi_source_w = w; //16

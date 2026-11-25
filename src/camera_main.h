@@ -231,6 +231,11 @@ struct event_msg {
 	char mediaPath[MAX_FILE_PATH_SIZE];
 	char imgTmpPath[MAX_FILE_PATH_SIZE];
 	char record_path[4][MAX_FILE_PATH_SIZE];
+	/* 蓝牙耳机 MAC，例如 "1C:52:16:AB:DB:88"。空字符串表示本地声卡 hw:0,0。
+	 * 不能放进 record_path：get_save_filename() 会把 record_path 覆盖成录像文件路径。 */
+	char audio_card_name[32];
+	int audio_sample_rate;   /* 封装和 AENC 固定 48000 */
+	int audio_frame_samples; /* MP3 帧长，48k 为 1152 */
 	char capture_path[5][MAX_FILE_PATH_SIZE];
 	char ai_path[2][MAX_FILE_PATH_SIZE];
 	char rtmp_url[MAX_URL_PATH_SIZE];

@@ -272,21 +272,20 @@ RK_S32 open_device_ai(RK_S32 InputSampleRate, RK_S32 OutputSampleRate,
 #endif
 
 
-	char card_name[128] = {0};
-//	if(emsg.record_path[3][0] != 0x0){
-//		memcpy(card_name, emsg.record_path[3], sizeof(card_name));
-//	}
-
-    printf("sclu card_name=%s\n", card_name);
-	if(card_name[0] == 0x0){
-		snprintf((char *)aiAttr.u8CardName,sizeof(aiAttr.u8CardName), "%s", "hw:0,0");
+	/* audio_card_name 只保存 MAC。空则本地声卡，非空则切到蓝牙 SCO。
+	 * u8CardName 为 64 字节，"bluealsa:DEV=" + MAC + ",PROFILE=sco" 约 43 字节。 */
+	if(emsg.audio_card_name[0] == '\0'){
+		snprintf((char *)aiAttr.u8CardName, sizeof(aiAttr.u8CardName), "%s", "hw:0,0");
 	}else{
-		snprintf((char *)aiAttr.u8CardName,sizeof(aiAttr.u8CardName), "%s%s%s", "bluealsa:DEV=",card_name,",PROFILE=sco");
+		snprintf((char *)aiAttr.u8CardName, sizeof(aiAttr.u8CardName), "%s%s%s",
+			"bluealsa:DEV=", emsg.audio_card_name, ",PROFILE=sco");
 	}
+	printf("open_device_ai card=%s\n", aiAttr.u8CardName);
 
 	// s32DeviceSampleRate 和 OutputSampleRate,OutputSampleRate
 	// 可以使用其他采样率，需要调用重采样函数。默认一样采样率。
-	aiAttr.soundCard.channels = 2;
+	/* 声道数由调用方传入。录像固定传 2，单声道打开这版 rockit 会失败。 */
+	aiAttr.soundCard.channels = channel;
 	aiAttr.soundCard.sampleRate = InputSampleRate;
 	aiAttr.soundCard.bitWidth = AUDIO_BIT_WIDTH_16;
 	aiAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
@@ -305,18 +304,27 @@ RK_S32 open_device_ai(RK_S32 InputSampleRate, RK_S32 OutputSampleRate,
 	//以下参数无特殊需求，无需变动，保持默认值即可
 	aiAttr.u32FrmNum = 4;
 	aiAttr.u32EXFlag = 0;
-	aiAttr.u32ChnCnt = 2;
+	aiAttr.u32ChnCnt = channel;
 
-	result = RK_MPI_AI_SetPubAttr(aiDevId, &aiAttr);
-	if (result != 0) {
-		printf("ai set attr fail, reason = %d", result);
-		goto __FAILED;
-	}
-
-	result = RK_MPI_AI_Enable(aiDevId);
-	if (result != 0) {
-		printf("ai enable fail, reason = %d", result);
-		goto __FAILED;
+	/* 失败立刻返回，由外面的循环再试。在这里连睡 3 次会把打开拖成大约 2 秒。 */
+	int enableTries = 1;
+	for (int i = 0; i < enableTries; i++) {
+		result = RK_MPI_AI_SetPubAttr(aiDevId, &aiAttr);
+		if (result != 0) {
+			printf("ai set attr fail, reason = %d\n", result);
+			goto __FAILED;
+		}
+		result = RK_MPI_AI_Enable(aiDevId);
+		if (result == RK_SUCCESS) {
+			break;
+		}
+		printf("ai enable fail, reason = %d (%s), try %d/%d\n", result,
+			result == RK_ERR_AI_BUSY ? "BUSY" : "other", i + 1, enableTries);
+		RK_MPI_AI_Disable(aiDevId);
+		if (result != RK_ERR_AI_BUSY || i + 1 >= enableTries) {
+			goto __FAILED;
+		}
+		usleep(200 * 1000);
 	}
 
 	memset(&pstParams, 0, sizeof(AI_CHN_PARAM_S));
@@ -324,19 +332,16 @@ RK_S32 open_device_ai(RK_S32 InputSampleRate, RK_S32 OutputSampleRate,
 	pstParams.s32UsrFrmDepth = 1;
 	result = RK_MPI_AI_SetChnParam(aiDevId, aiChn, &pstParams);
 	if (result != RK_SUCCESS) {
-		printf("ai set channel params, aiChn = %d", aiChn);
-		return RK_FAILURE;
+		printf("ai set channel params, aiChn = %d\n", aiChn);
+		goto __DISABLE;
 	}
 
 	// init_ai_vqe(OutputSampleRate);
-	if (channel == 1)
-		RK_MPI_AI_SetTrackMode(aiDevId, AUDIO_TRACK_FRONT_LEFT);
-	else
-		RK_MPI_AI_SetTrackMode(aiDevId, AUDIO_TRACK_NORMAL);
+	RK_MPI_AI_SetTrackMode(aiDevId, AUDIO_TRACK_NORMAL);
 	result = RK_MPI_AI_EnableChn(aiDevId, aiChn);
 	if (result != 0) {
-		printf("ai enable channel fail, aiChn = %d, reason = %x", aiChn, result);
-		return RK_FAILURE;
+		printf("ai enable channel fail, aiChn = %d, reason = %x\n", aiChn, result);
+		goto __DISABLE;
 	}
 
 	if (needResample == RK_TRUE) {
@@ -344,14 +349,17 @@ RK_S32 open_device_ai(RK_S32 InputSampleRate, RK_S32 OutputSampleRate,
 		result =
 		    RK_MPI_AI_EnableReSmp(aiDevId, aiChn, (AUDIO_SAMPLE_RATE_E)OutputSampleRate);
 		if (result != 0) {
-			printf("ai enable channel fail, reason = %x, aiChn = %d", result, aiChn);
-			return RK_FAILURE;
+			printf("ai resample fail, reason = %x, aiChn = %d\n", result, aiChn);
+			goto __DISABLE;
 		}
 	}
 
 	ai_set_other(100);
 
 	return RK_SUCCESS;
+__DISABLE:
+	RK_MPI_AI_DisableChn(aiDevId, aiChn);
+	RK_MPI_AI_Disable(aiDevId);
 __FAILED:
 	return RK_FAILURE;
 }
@@ -374,7 +382,8 @@ RK_S32 init_mpi_aenc(RK_S32 s32SampleRate, RK_S32 channel) {
 	pstChnAttr.stCodecAttr.enBitwidth = enBitwidth;
 	pstChnAttr.stCodecAttr.pstResv = RK_NULL;
     if (enCodecId == RK_AUDIO_ID_MP3) {
-        pstChnAttr.stCodecAttr.u32Resv[0] = 1152;
+        /* MPEG-1(32k/44.1k/48k) 每帧 1152 点；MPEG-2(16k/22.05k/24k) 每帧 576 点 */
+        pstChnAttr.stCodecAttr.u32Resv[0] = (s32SampleRate <= 24000) ? 576 : 1152;
         pstChnAttr.stCodecAttr.u32Resv[1] = 160000;
     }
 
